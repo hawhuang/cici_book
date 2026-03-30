@@ -1,0 +1,10 @@
+# 本地 libsql 缓存
+cici_book.db
+
+# Streamlit secrets（部署时通过 Streamlit Cloud 管理）
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.env
