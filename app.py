@@ -3,6 +3,7 @@ import dashscope
 from dashscope import MultiModalConversation, Generation, ImageSynthesis
 import io, re, os, socket, qrcode, base64, requests, json
 import pandas as pd
+from PIL import Image
 
 # --- 1. 基础配置 ---
 dashscope.api_key = st.secrets["dashscope"]["api_key"]
@@ -409,25 +410,79 @@ with st.expander("📷 拍照识字"):
     # 第一步：识别
     if files and st.button("🔍 开始识别"):
         all_words, all_chars = [], []
-        with st.spinner("识别中..."):
-            for f in files:
-                b64 = base64.b64encode(f.getvalue()).decode("utf-8")
-                msg = [{"role": "user", "content": [{"image": f"data:image/png;base64,{b64}"}, {"text": "提取文字"}]}]
-                try:
-                    res = MultiModalConversation.call(model=VISION_MODEL, messages=msg)
-                    if res.status_code == 200:
-                        t = res.output.choices[0].message.content[0]['text']
+        progress_bar = st.progress(0, text="准备识别...")
+        total = len(files)
+        has_error = False
+        
+        for i, f in enumerate(files):
+            progress_bar.progress((i) / total, text=f"正在识别第 {i+1}/{total} 张图片...")
+            try:
+                # 压缩图片以减小请求体，避免传输超时
+                img = Image.open(f)
+                # 如果图片过大，缩放到最大 1024px
+                max_size = 1024
+                if max(img.size) > max_size:
+                    ratio = max_size / max(img.size)
+                    new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+                    img = img.resize(new_size, Image.LANCZOS)
+                # 转为 JPEG 格式压缩
+                buf = io.BytesIO()
+                img.convert('RGB').save(buf, format='JPEG', quality=85)
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                
+                msg = [{"role": "user", "content": [{"image": f"data:image/jpeg;base64,{b64}"}, {"text": "请提取图片中的所有文字，包括中文和英文"}]}]
+                
+                # 使用 requests 直接调用 API，可以控制超时
+                headers = {
+                    "Authorization": f"Bearer {dashscope.api_key}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": VISION_MODEL,
+                    "input": {"messages": msg},
+                    "parameters": {}
+                }
+                resp = requests.post(
+                    "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+                    headers=headers,
+                    json=payload,
+                    timeout=60  # 60秒超时，避免无限等待
+                )
+                
+                if resp.status_code == 200:
+                    res_json = resp.json()
+                    if 'output' in res_json and 'choices' in res_json['output']:
+                        t = res_json['output']['choices'][0]['message']['content'][0].get('text', '')
                         all_words.extend(re.findall(r'\b[a-zA-Z]{2,}\b', t.lower()))
                         all_chars.extend(re.findall(r'[\u4e00-\u9fa5]', t))
                     else:
-                        st.error(f"识别失败: {res.code}")
-                except Exception as e:
-                    st.error(f"识别出错: {str(e)}")
+                        st.warning(f"第 {i+1} 张图片响应格式异常")
+                else:
+                    error_msg = resp.json().get('message', resp.text[:200]) if resp.text else f"HTTP {resp.status_code}"
+                    st.error(f"第 {i+1} 张识别失败: {error_msg}")
+                    has_error = True
+                    
+            except requests.exceptions.Timeout:
+                st.error(f"第 {i+1} 张图片识别超时（60秒），已跳过")
+                has_error = True
+            except requests.exceptions.ConnectionError:
+                st.error(f"第 {i+1} 张图片网络连接失败，请检查网络")
+                has_error = True
+            except Exception as e:
+                st.error(f"第 {i+1} 张识别出错: {type(e).__name__}: {str(e)}")
+                has_error = True
         
-        st.session_state.ocr_words = ", ".join(sorted(set(all_words)))
-        st.session_state.ocr_chars = " ".join(sorted(set(all_chars)))
-        st.session_state.ocr_done = True
-        st.rerun()
+        progress_bar.progress(1.0, text="识别完成！")
+        
+        if all_words or all_chars:
+            st.session_state.ocr_words = ", ".join(sorted(set(all_words)))
+            st.session_state.ocr_chars = " ".join(sorted(set(all_chars)))
+            st.session_state.ocr_done = True
+            st.rerun()
+        elif not has_error:
+            st.warning("未识别到任何文字，请检查图片内容")
+        else:
+            st.error("识别过程中出现错误，请重试")
     
     # 第二步：编辑确认
     if st.session_state.ocr_done:
