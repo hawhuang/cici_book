@@ -4,4 +4,3 @@ qrcode>=7.4
 Pillow>=10.0.0
 pandas>=2.0.0
 requests>=2.31.0
-libsql-experimental>=0.0.49

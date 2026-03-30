@@ -1,9 +1,8 @@
 import streamlit as st
 import dashscope
 from dashscope import MultiModalConversation, Generation, ImageSynthesis
-import io, re, os, socket, qrcode, base64, requests
+import io, re, os, socket, qrcode, base64, requests, json
 import pandas as pd
-import libsql_experimental as libsql
 
 # --- 1. 基础配置 ---
 dashscope.api_key = st.secrets["dashscope"]["api_key"]
@@ -12,45 +11,74 @@ VISION_MODEL = 'qwen-vl-max'
 TEXT_MODEL = 'qwen-max'
 IMAGE_MODEL = 'qwen-image-2.0'
 
-TURSO_URL = st.secrets["turso"]["url"]
+# Turso HTTP API 配置
+# 将 libsql:// 协议转换为 https:// 用于 HTTP API
+_turso_raw_url = st.secrets["turso"]["url"]
+TURSO_HTTP_URL = _turso_raw_url.replace("libsql://", "https://")
 TURSO_TOKEN = st.secrets["turso"]["token"]
 
-# --- 2. 数据库初始化与基础功能函数 ---
-def get_db_connection():
-    """获取 Turso 数据库连接"""
-    conn = libsql.connect("cici_book.db", sync_url=TURSO_URL, auth_token=TURSO_TOKEN)
-    conn.sync()
-    return conn
+# --- 2. Turso HTTP API 数据库操作 ---
+def _turso_execute(statements):
+    """通过 Turso HTTP API 执行 SQL 语句
+    
+    Args:
+        statements: SQL 语句列表，每项可以是:
+            - 字符串: 简单 SQL
+            - dict: {"q": "SQL", "params": [...]} 带参数的 SQL
+    Returns:
+        API 响应的 JSON（包含 results 数组）
+    """
+    url = f"{TURSO_HTTP_URL}/v3/pipeline"
+    headers = {
+        "Authorization": f"Bearer {TURSO_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    # 构建 pipeline 请求体
+    req_body = {"requests": []}
+    for stmt in statements:
+        if isinstance(stmt, str):
+            req_body["requests"].append({"type": "execute", "stmt": {"sql": stmt}})
+        elif isinstance(stmt, dict):
+            s = {"sql": stmt["q"]}
+            if "params" in stmt:
+                # 位置参数
+                s["args"] = [{"type": "text", "value": str(v)} for v in stmt["params"]]
+            req_body["requests"].append({"type": "execute", "stmt": s})
+    # 最后加一个 close
+    req_body["requests"].append({"type": "close"})
+    
+    resp = requests.post(url, headers=headers, json=req_body, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
 
 def init_db():
     """初始化数据库表结构"""
-    conn = get_db_connection()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS vocabulary (
+    _turso_execute([
+        """CREATE TABLE IF NOT EXISTS vocabulary (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             content TEXT NOT NULL,
             type TEXT NOT NULL CHECK(type IN ('word', 'char')),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(content, type)
-        )
-    """)
-    conn.commit()
-    conn.sync()
-    conn.close()
+        )"""
+    ])
 
 def load_history():
     """从 Turso 数据库加载历史记录"""
     all_words, all_chars = set(), set()
     try:
-        conn = get_db_connection()
-        rows = conn.execute("SELECT content, type FROM vocabulary").fetchall()
+        result = _turso_execute(["SELECT content, type FROM vocabulary"])
+        # 解析 pipeline 响应: results[0].response.result.rows
+        rows = result.get("results", [{}])[0].get("response", {}).get("result", {}).get("rows", [])
         for row in rows:
-            content, vtype = row[0], row[1]
+            # 每行是一个数组，每个元素是 {"type": "text", "value": "..."}
+            content = row[0].get("value", "")
+            vtype = row[1].get("value", "")
             if vtype == 'word':
                 all_words.add(content)
             elif vtype == 'char':
                 all_chars.add(content)
-        conn.close()
     except Exception as e:
         st.error(f"加载数据失败: {str(e)}")
     return sorted(list(all_words)), sorted(list(all_chars))
@@ -58,35 +86,29 @@ def load_history():
 def save_history(words, chars):
     """保存更新后的列表到 Turso 数据库（全量覆盖）"""
     try:
-        conn = get_db_connection()
-        # 清空旧数据
-        conn.execute("DELETE FROM vocabulary")
-        # 插入新数据
+        stmts = ["DELETE FROM vocabulary"]
         for w in words:
             if w.strip():
-                conn.execute("INSERT OR IGNORE INTO vocabulary (content, type) VALUES (?, ?)", (w.strip(), 'word'))
+                stmts.append({"q": "INSERT OR IGNORE INTO vocabulary (content, type) VALUES (?, ?)", "params": [w.strip(), "word"]})
         for c in chars:
             if c.strip():
-                conn.execute("INSERT OR IGNORE INTO vocabulary (content, type) VALUES (?, ?)", (c.strip(), 'char'))
-        conn.commit()
-        conn.sync()
-        conn.close()
+                stmts.append({"q": "INSERT OR IGNORE INTO vocabulary (content, type) VALUES (?, ?)", "params": [c.strip(), "char"]})
+        _turso_execute(stmts)
     except Exception as e:
         st.error(f"保存失败: {str(e)}")
 
 def append_history(words, chars):
     """追加新词到 Turso 数据库（不覆盖已有数据）"""
     try:
-        conn = get_db_connection()
+        stmts = []
         for w in words:
             if w.strip():
-                conn.execute("INSERT OR IGNORE INTO vocabulary (content, type) VALUES (?, ?)", (w.strip(), 'word'))
+                stmts.append({"q": "INSERT OR IGNORE INTO vocabulary (content, type) VALUES (?, ?)", "params": [w.strip(), "word"]})
         for c in chars:
             if c.strip():
-                conn.execute("INSERT OR IGNORE INTO vocabulary (content, type) VALUES (?, ?)", (c.strip(), 'char'))
-        conn.commit()
-        conn.sync()
-        conn.close()
+                stmts.append({"q": "INSERT OR IGNORE INTO vocabulary (content, type) VALUES (?, ?)", "params": [c.strip(), "char"]})
+        if stmts:
+            _turso_execute(stmts)
     except Exception as e:
         st.error(f"追加保存失败: {str(e)}")
 
